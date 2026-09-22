@@ -1,0 +1,424 @@
+"""Tests for the shared LLM layer.
+
+The Anthropic client is faked, so these need neither a key nor network. They
+cover the three things the rest of the A-part work depends on:
+
+* configuration errors surface as :class:`LLMNotConfiguredError`, not a 500;
+* schema misses are retried exactly once and then fail loudly (§14-6);
+* the request we build never contains a parameter that returns HTTP 400
+  (``docs/plan-A.md`` §4.4) — this is the guard that keeps the other services
+  from silently regressing into a 400 on every call.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import anthropic
+import httpx2
+import pytest
+from pydantic import BaseModel
+
+from app.config import get_settings
+from app.services import llm
+
+
+class _Sample(BaseModel):
+    value: str
+
+
+class _FakeParsed:
+    """Stands in for ``ParsedMessage``: only ``parsed_output`` is read."""
+
+    def __init__(self, parsed: _Sample | None) -> None:
+        self.parsed_output = parsed
+        self.stop_reason = "end_turn"
+
+
+class _FakeBlock:
+    def __init__(self, type_: str, text: str = "") -> None:
+        self.type = type_
+        self.text = text
+
+
+class _FakeMessage:
+    def __init__(self, blocks: list[_FakeBlock]) -> None:
+        self.content = blocks
+
+
+class _FakeMessages:
+    """Records every call so tests can assert on attempt counts and kwargs."""
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    def _next(self, kwargs: dict[str, Any]) -> Any:
+        self.calls.append(kwargs)
+        result = self._results.pop(0) if self._results else None
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def parse(self, **kwargs: Any) -> Any:
+        return self._next(kwargs)
+
+    def create(self, **kwargs: Any) -> Any:
+        return self._next(kwargs)
+
+
+class _FakeClient:
+    def __init__(self, results: list[Any]) -> None:
+        self.messages = _FakeMessages(results)
+
+
+class _FakeGeminiModels:
+    def __init__(self, results: list[Any]) -> None:
+        self._results = list(results)
+        self.calls: list[dict[str, Any]] = []
+
+    def generate_content(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        result = self._results.pop(0) if self._results else None
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class _FakeGeminiClient:
+    def __init__(self, results: list[Any]) -> None:
+        self.models = _FakeGeminiModels(results)
+
+
+class _FakeGeminiResponse:
+    def __init__(self, *, text: str = "", parsed: Any = None) -> None:
+        self.text = text
+        self.parsed = parsed
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, *results: Any) -> _FakeClient:
+    """Replace the cached client with a fake returning ``results`` in order."""
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    client = _FakeClient(list(results))
+    monkeypatch.setattr(llm, "get_client", lambda: client)
+    return client
+
+
+def _install_gemini(monkeypatch: pytest.MonkeyPatch, *results: Any) -> _FakeGeminiClient:
+    client = _FakeGeminiClient(list(results))
+    settings = type(
+        "S",
+        (),
+        {"llm_provider": "gemini", "gemini_api_key": "g-test"},
+    )()
+    monkeypatch.setattr(llm, "get_settings", lambda: settings)
+    monkeypatch.setattr(llm, "get_gemini_client", lambda: client)
+    return client
+
+
+def _bad_request() -> anthropic.BadRequestError:
+    response = httpx2.Response(400, request=httpx2.Request("POST", "https://api.test/v1"))
+    return anthropic.BadRequestError("unsupported parameter", response=response, body=None)
+
+
+# --- configuration ----------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolated_caches() -> Any:
+    """Clear the process-wide lru_caches on both sides of every test here.
+
+    ``get_settings``/``get_client`` are deliberately cached (§14-8); clearing
+    only *before* a test would leak this module's state to whichever test runs
+    next, coupling the suite to execution order.
+    """
+    cached_functions = (get_settings, llm.get_client, llm.get_gemini_client)
+    for function in cached_functions:
+        function.cache_clear()
+    yield
+    for function in cached_functions:
+        function.cache_clear()
+
+
+def test_get_client_without_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        llm, "get_settings", lambda: type("S", (), {"anthropic_api_key": None})()
+    )
+    with pytest.raises(llm.LLMNotConfiguredError):
+        llm.get_client()
+
+
+def test_is_configured_reflects_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        llm, "get_settings", lambda: type("S", (), {"anthropic_api_key": "sk-test"})()
+    )
+    assert llm.is_configured() is True
+
+
+def test_is_configured_reflects_gemini_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        llm,
+        "get_settings",
+        lambda: type("S", (), {"llm_provider": "gemini", "gemini_api_key": "g-test"})(),
+    )
+    assert llm.is_configured() is True
+
+
+def test_gemini_client_without_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        llm,
+        "get_settings",
+        lambda: type("S", (), {"llm_provider": "gemini", "gemini_api_key": None})(),
+    )
+    with pytest.raises(llm.LLMNotConfiguredError):
+        llm.get_gemini_client()
+
+
+# --- structured calls -------------------------------------------------------
+
+
+def test_call_structured_returns_validated_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, _FakeParsed(_Sample(value="ok")))
+    result = llm.call_structured(
+        model="m", system="s", user="u", output_format=_Sample
+    )
+    assert result.value == "ok"
+
+
+def test_call_structured_retries_once_on_schema_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _install(monkeypatch, _FakeParsed(None), _FakeParsed(_Sample(value="ok")))
+    result = llm.call_structured(
+        model="m", system="s", user="u", output_format=_Sample
+    )
+    assert result.value == "ok"
+    assert len(client.messages.calls) == 2
+
+
+def test_call_structured_gives_up_after_one_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _install(monkeypatch, _FakeParsed(None), _FakeParsed(None))
+    with pytest.raises(llm.LLMCallError):
+        llm.call_structured(model="m", system="s", user="u", output_format=_Sample)
+    assert len(client.messages.calls) == 2
+
+
+def test_call_structured_does_not_retry_bad_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400 means our request is malformed; retrying it is pure waste."""
+    client = _install(monkeypatch, _bad_request(), _FakeParsed(_Sample(value="ok")))
+    with pytest.raises(llm.LLMCallError):
+        llm.call_structured(model="m", system="s", user="u", output_format=_Sample)
+    assert len(client.messages.calls) == 1
+
+
+def test_call_structured_omits_parameters_that_return_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guard for docs/plan-A.md §4.4.
+
+    ``temperature`` / ``top_p`` / ``top_k`` and the old ``thinking`` form are
+    rejected on claude-sonnet-5, and an assistant prefill is rejected outright.
+    """
+    client = _install(monkeypatch, _FakeParsed(_Sample(value="ok")))
+    llm.call_structured(model="m", system="s", user="u", output_format=_Sample)
+
+    sent = client.messages.calls[0]
+    for forbidden in ("temperature", "top_p", "top_k", "thinking"):
+        assert forbidden not in sent
+    assert [m["role"] for m in sent["messages"]] == ["user"]
+
+
+def test_call_structured_passes_effort_only_when_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _install(monkeypatch, _FakeParsed(_Sample(value="ok")))
+    llm.call_structured(model="m", system="s", user="u", output_format=_Sample)
+    assert "output_config" not in client.messages.calls[0]
+
+    client = _install(monkeypatch, _FakeParsed(_Sample(value="ok")))
+    llm.call_structured(
+        model="m", system="s", user="u", output_format=_Sample, effort="low"
+    )
+    assert client.messages.calls[0]["output_config"] == {"effort": "low"}
+
+
+# --- text calls -------------------------------------------------------------
+
+
+def test_call_text_joins_text_blocks_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Thinking blocks can precede text, so indexing content[0] is unsafe."""
+    _install(
+        monkeypatch,
+        _FakeMessage([_FakeBlock("thinking"), _FakeBlock("text", "  질문입니다?  ")]),
+    )
+    assert llm.call_text(model="m", system="s", user="u") == "질문입니다?"
+
+
+def test_call_text_logs_elapsed_time_without_prompt_contents(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install(monkeypatch, _FakeMessage([_FakeBlock("text", "응답")]))
+    with caplog.at_level(logging.INFO, logger=llm.logger.name):
+        llm.call_text(model="m", system="secret system", user="secret user")
+
+    assert "llm_call completed" in caplog.text
+    assert "provider=anthropic" in caplog.text
+    assert "model=m" in caplog.text
+    assert "elapsed_ms=" in caplog.text
+    assert "secret system" not in caplog.text
+    assert "secret user" not in caplog.text
+
+
+def test_call_text_raises_on_empty_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, _FakeMessage([_FakeBlock("text", "   ")]))
+    with pytest.raises(llm.LLMCallError):
+        llm.call_text(model="m", system="s", user="u")
+
+
+def test_call_text_wraps_api_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, _bad_request())
+    with pytest.raises(llm.LLMCallError):
+        llm.call_text(model="m", system="s", user="u")
+
+    contents = llm._FAILURE_LOG_PATH.read_text(encoding="utf-8")
+    assert contents.count("===== LLM CALL FAILURE =====") == 1
+    assert "model: m" in contents
+    assert "input_prompt:\n[system]" in contents
+    assert "\n[user]\nu" in contents
+    assert "answer:\n(응답 없음)" in contents
+    assert "failure_reason: LLMCallError:" in contents
+
+
+def test_failure_log_write_error_preserves_llm_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, _bad_request())
+    monkeypatch.setattr(llm, "_FAILURE_LOG_PATH", llm._FAILURE_LOG_PATH.parent)
+    with pytest.raises(llm.LLMCallError, match="LLM 요청이 거부되었습니다"):
+        llm.call_text(model="m", system="s", user="u")
+
+
+# --- Gemini calls ----------------------------------------------------------
+
+
+def test_gemini_call_text_uses_provider_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _install_gemini(
+        monkeypatch, _FakeGeminiResponse(text="  개인화 질문?  ")
+    )
+    assert llm.call_text(model="gemini-model", system="system", user="user") == (
+        "개인화 질문?"
+    )
+    sent = client.models.calls[0]
+    assert sent["model"] == "gemini-model"
+    assert sent["contents"] == "user"
+    assert sent["config"] == {
+        "system_instruction": "system",
+        "max_output_tokens": llm.DEFAULT_TEXT_MAX_TOKENS,
+        "thinking_config": {"thinking_level": "minimal"},
+    }
+
+
+def test_gemini_call_structured_returns_validated_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _install_gemini(
+        monkeypatch,
+        _FakeGeminiResponse(text='{"value":"ok"}'),
+    )
+    result = llm.call_structured(
+        model="gemini-model", system="s", user="u", output_format=_Sample
+    )
+    assert result == _Sample(value="ok")
+    config = client.models.calls[0]["config"]
+    assert config["thinking_config"] == {"thinking_level": "minimal"}
+    assert "response_mime_type" not in config
+    assert "response_schema" not in config
+    assert '"value"' in client.models.calls[0]["contents"]
+    assert '"type":"string"' in client.models.calls[0]["contents"]
+
+
+def test_gemini_structured_accepts_json_code_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_gemini(
+        monkeypatch,
+        _FakeGeminiResponse(text='```json\n{"value":"ok"}\n```'),
+    )
+    result = llm.call_structured(
+        model="gemini-model", system="s", user="u", output_format=_Sample
+    )
+    assert result == _Sample(value="ok")
+
+
+def test_gemini_structured_retries_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _install_gemini(
+        monkeypatch,
+        _FakeGeminiResponse(text="not json"),
+        _FakeGeminiResponse(parsed=_Sample(value="ok")),
+    )
+    result = llm.call_structured(
+        model="gemini-model", system="s", user="u", output_format=_Sample
+    )
+    assert result.value == "ok"
+    assert len(client.models.calls) == 2
+
+
+def test_gemini_api_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_gemini(monkeypatch, RuntimeError("boom"))
+    with pytest.raises(llm.LLMCallError, match="Gemini 호출"):
+        llm.call_text(model="gemini-model", system="s", user="u")
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [(500, 503, 200), (500, 500, 500, 500, 500), (400,)],
+)
+def test_gemini_sdk_retries_transient_errors_only(
+    monkeypatch: pytest.MonkeyPatch, statuses: tuple[int, ...],
+) -> None:
+    import httpx
+    from google import genai
+
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        status = statuses[len(calls)]
+        calls.append(request)
+        body = (
+            {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+            if status == 200 else {"error": {"code": status, "message": "synthetic"}}
+        )
+        return httpx.Response(status, json=body)
+
+    constructor = genai.Client
+
+    def fake_transport_client(**kwargs: Any) -> Any:
+        kwargs["http_options"]["client_args"] = {"transport": httpx.MockTransport(respond)}
+        client = constructor(**kwargs, vertexai=False)
+        client._api_client._retry.sleep = lambda _: None
+        return client
+
+    monkeypatch.setattr(genai, "Client", fake_transport_client)
+    monkeypatch.setattr(
+        llm, "get_settings",
+        lambda: type("S", (), {"llm_provider": "gemini", "gemini_api_key": "test"})(),
+    )
+    try:
+        if statuses[-1] == 200:
+            assert llm.call_text(model="gemma-test", system="s", user="u") == "ok"
+        else:
+            with pytest.raises(llm.LLMCallError, match="Gemini 호출"):
+                llm.call_text(model="gemma-test", system="s", user="u")
+        assert len(calls) == len(statuses)
+    finally:
+        llm.get_gemini_client().close()
+
+
+def test_gemini_caps_large_output_reservations() -> None:
+    assert llm._gemini_config("system", 16_000)["max_output_tokens"] == 8_192
