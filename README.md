@@ -232,3 +232,7 @@ InterReview는 **Supertone Inc.의 Supertonic 3를 로컬 TTS 구성 요소로 �
 모델 사용에는 Open RAIL-M 제5항과 Attachment A의 사용 제한이 적용됩니다. 모델 사용자도 이를 준수해야 하며, 합성 음성임을 명확하게 알리고 무단 사칭·유해한 허위 정보 생성 등 금지된 목적으로 사용해서는 안 됩니다. 전체 제한은 라이선스 전문이 기준입니다.
 
 모델을 포함한 배포본이나 원격 서비스를 제공할 때에는 제4항에 따라 라이선스 사본과 관련 권리·출처 고지를 보존하고, 사용 제한을 이용·배포 계약의 집행 가능한 조항으로 반영하여 후속 사용자에게 고지해야 합니다. 모델 파일을 수정한 경우 변경 사실도 명시해야 합니다. SDK를 재배포할 때에는 MIT 저작권·허가 고지를 함께 보존해야 합니다. 이 안내는 InterReview 자체에 해당 라이선스를 일괄 적용한다는 의미가 아닙니다.
+
+### 5.8. 유튜브 영상 추가
+
+[![InterReview 소개 영상](https://img.youtube.com/vi/4t1F1gKlFFE/hqdefault.jpg)](https://www.youtube.com/watch?v=4t1F1gKlFFE&list=PLO6qooGfURhY&index=16)
